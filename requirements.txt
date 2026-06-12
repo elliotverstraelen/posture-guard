@@ -1,5 +1,6 @@
+# mediapipe 0.10.15+ dropped mp.solutions on some platforms — pin to last known-good version
+mediapipe==0.10.14
 opencv-python
-mediapipe
 flask
 requests
 numpy

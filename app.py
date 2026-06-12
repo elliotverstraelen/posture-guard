@@ -293,9 +293,39 @@ def api_session_report():
     return jsonify({"ok": True})
 
 
+# ── Camera permission pre-flight ───────────────────────────────────────────────
+
+def _preflight_camera() -> bool:
+    """
+    macOS requires the camera permission dialog to appear on the main thread.
+    Open and immediately release the camera here (before the background thread
+    starts) so the system shows the 'Terminal wants to use the camera' dialog.
+
+    Returns True if the camera is accessible, False if permission was denied.
+    """
+    import platform
+    if platform.system() != "Darwin":
+        return True
+
+    cap = cv2.VideoCapture(0)
+    ok = cap.isOpened()
+    cap.release()
+
+    if not ok:
+        print(
+            "\n[PostureGuard] Camera not accessible.\n"
+            "  1. Go to  System Settings → Privacy & Security → Camera\n"
+            "  2. Enable  Terminal  (or your Python app)\n"
+            "  3. Restart the app.\n"
+            "  Or run:  tccutil reset Camera com.apple.Terminal\n"
+        )
+    return ok
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    _preflight_camera()   # must happen on the main thread to trigger macOS permission dialog
     threading.Thread(target=_camera_loop, daemon=True).start()
     print("PostureGuard running → http://127.0.0.1:5000")
     # use_reloader=False is required — Flask's reloader would start a second camera thread
