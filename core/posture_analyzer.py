@@ -10,7 +10,7 @@ _RIGHT_SHOULDER = 12
 # Deviation thresholds (all normalised relative to shoulder width unless noted)
 HEAD_DROP_THRESHOLD = 0.12
 SHOULDER_TILT_THRESHOLD = 0.06
-EAR_TILT_THRESHOLD_DEG = 8.0
+EAR_TILT_THRESHOLD_DEG = 12.0  # raised from 8° — ear landmarks are noisy when hair covers ears
 FORWARD_LEAN_THRESHOLD = 0.07
 
 # Score deduction per fully-triggered alert
@@ -18,7 +18,7 @@ _DEDUCTIONS = {
     "head_drop": 35,
     "forward_lean": 25,
     "shoulder_tilt": 20,
-    "head_tilt": 20,
+    "head_tilt": 10,  # reduced — head tilt detection is inherently noisier than other signals
 }
 
 # Human-readable labels for the UI / coach
@@ -92,9 +92,9 @@ class PostureAnalyzer:
             alerts.append({"type": "shoulder_tilt", "msg": ALERT_LABELS["shoulder_tilt"], "severity": round(sev, 2)})
             score -= int(_DEDUCTIONS["shoulder_tilt"] * sev)
 
-        # 3. Head tilt — ear line not horizontal
+        # 3. Head tilt — only when both ears were clearly visible in this frame
         tilt_dev = abs(curr["ear_tilt"] - self.baseline["ear_tilt"])
-        if tilt_dev > EAR_TILT_THRESHOLD_DEG:
+        if curr["ears_visible"] and tilt_dev > EAR_TILT_THRESHOLD_DEG:
             sev = min((tilt_dev - EAR_TILT_THRESHOLD_DEG) / EAR_TILT_THRESHOLD_DEG + 0.5, 1.0)
             alerts.append({"type": "head_tilt", "msg": ALERT_LABELS["head_tilt"], "severity": round(sev, 2)})
             score -= int(_DEDUCTIONS["head_tilt"] * sev)
@@ -123,7 +123,7 @@ class PostureAnalyzer:
         if l_sh.visibility < 0.5 or r_sh.visibility < 0.5:
             return None
 
-        nose = lm[_NOSE]
+        nose  = lm[_NOSE]
         l_ear = lm[_LEFT_EAR]
         r_ear = lm[_RIGHT_EAR]
 
@@ -133,19 +133,25 @@ class PostureAnalyzer:
         if sh_width < 0.01:
             sh_width = 0.01
 
+        # Only compute ear tilt when both ears are clearly visible.
+        # Hair, low light, or side-on angles push visibility below 0.5
+        # and cause noisy/false head-tilt readings.
+        ears_visible = l_ear.visibility >= 0.5 and r_ear.visibility >= 0.5
         ear_tilt = float(
             np.degrees(np.arctan2(r_ear.y - l_ear.y, r_ear.x - l_ear.x))
-        )
+        ) if ears_visible else 0.0
 
         return {
             # Positive = nose is below shoulder midpoint (bad); normally negative
-            "head_y": (nose.y - sh_mid_y) / sh_width,
+            "head_y":       (nose.y - sh_mid_y) / sh_width,
             # Signed tilt: left_sh.y - right_sh.y, normalised
-            "sh_tilt": (l_sh.y - r_sh.y) / sh_width,
-            # Ear line angle in degrees relative to horizontal
-            "ear_tilt": ear_tilt,
+            "sh_tilt":      (l_sh.y - r_sh.y) / sh_width,
+            # Ear line angle in degrees relative to horizontal (0 when ears not visible)
+            "ear_tilt":     ear_tilt,
+            # Flag so the analyzer can skip the check when ears weren't detected
+            "ears_visible": float(ears_visible),
             # Shoulder width in normalised image coordinates (larger = closer to camera)
-            "sh_width": sh_width,
+            "sh_width":     sh_width,
             # Horizontal head centering (not alerted on, but stored for future use)
-            "head_x": (nose.x - sh_mid_x) / sh_width,
+            "head_x":       (nose.x - sh_mid_x) / sh_width,
         }

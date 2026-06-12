@@ -1,26 +1,19 @@
 """
 PostureGuard — native macOS menu bar app.
 
-Lives in the menu bar with no dock icon.
-The menu updates every 3 seconds to reflect the current state.
-
-Run (development):
+Run (dev):
     .venv/bin/python menu_bar_app.py
 
 Install via Homebrew:
-    brew tap elliotverstraelen/postureguard
-    brew install postureguard
-    postureguard
-
-Package as a standalone .app:
-    .venv/bin/pip install py2app
-    python setup.py py2app
-    open dist/PostureGuard.app
+    brew tap elliotverstraelen/postureguard && brew install postureguard
 """
 
+import json
+import subprocess
 import threading
 import time
 from collections import deque
+from pathlib import Path
 
 import cv2
 import rumps
@@ -29,179 +22,336 @@ from ai.coach import get_coaching_tip
 from core.alert_manager import AlertManager
 from core.pose_detector import PoseDetector
 from core.posture_analyzer import PostureAnalyzer
+import core.snapshot_store as snapshots
+from ui.settings_window import SettingsWindow
+from ui.live_view_window import LiveViewWindow
 
-# ── Constants ──────────────────────────────────────────────────────────────────
-
+VERSION = "1.1.0"
+DASHBOARD_URL = "http://127.0.0.1:5000"
 CALIBRATION_FRAMES = 60
-SMOOTH_WINDOW      = 8
+SMOOTH_WINDOW = 8
+SNAPSHOT_MIN_INTERVAL = 120   # minimum gap between snapshots (seconds)
+SNAPSHOT_STABLE_SECS  = 15    # pose must be held this long before saving
+
+# A head-drop deviation this large (vs. baseline) signals phone-looking posture
+PHONE_HEAD_DROP_THRESHOLD = 0.28
 
 
-# ── Camera permission pre-flight ───────────────────────────────────────────────
+# ── Settings ──────────────────────────────────────────────────────────────────
 
-def _preflight_camera() -> None:
-    """
-    Trigger the macOS 'wants to access your camera' dialog.
-    Must be called from the main thread — background threads can't show it.
-    For the menu bar app, call this inside __init__ (before run() starts the
-    NSApplication event loop).
-    """
-    test = cv2.VideoCapture(0)
-    ok = test.isOpened()
-    test.release()
+_SETTINGS_PATH = Path.home() / ".config" / "postureguard" / "settings.json"
+_DEFAULTS: dict = {
+    "camera_index":             0,
+    "use_all_cameras":          False,
+    "phone_detection_enabled":  False,
+    "phone_alert_minutes":      10,
+    "alert_threshold_seconds":  30,
+}
+
+
+class Settings:
+    """Persistent preferences stored in ~/.config/postureguard/settings.json."""
+
+    def __init__(self):
+        self._data = dict(_DEFAULTS)
+        if _SETTINGS_PATH.exists():
+            try:
+                with open(_SETTINGS_PATH) as f:
+                    saved = json.load(f)
+                self._data.update({k: saved[k] for k in _DEFAULTS if k in saved})
+            except Exception:
+                pass
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            return self._data[name]
+        except KeyError:
+            raise AttributeError(name)
+
+    def set(self, key: str, value):
+        self._data[key] = value
+        _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_SETTINGS_PATH, "w") as f:
+            json.dump(self._data, f, indent=2)
+
+
+# ── Camera enumeration ────────────────────────────────────────────────────────
+
+def _detect_cameras() -> list:
+    """Return [(cv_index, label), ...] for every camera that can be opened."""
+    names = []
+    try:
+        raw = subprocess.check_output(
+            ["system_profiler", "SPCameraDataType"], text=True, timeout=5
+        )
+        skip_prefixes = ("Unique ID", "Model ID", "Serial", "Revision",
+                         "Location", "Speed", "Cameras", "Camera Data")
+        for line in raw.splitlines():
+            s = line.strip()
+            if s.endswith(":") and not any(s.startswith(p) for p in skip_prefixes):
+                names.append(s[:-1])
+    except Exception:
+        pass
+
+    result, name_idx = [], 0
+    for i in range(6):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            cap.release()
+            label = names[name_idx] if name_idx < len(names) else f"Camera {i}"
+            result.append((i, label))
+            name_idx += 1
+    return result
+
+
+# ── Camera pre-flight ─────────────────────────────────────────────────────────
+
+def _preflight_camera(index: int = 0) -> bool:
+    """Open & immediately close the camera on the main thread to trigger the macOS permission dialog."""
+    cap = cv2.VideoCapture(index)
+    ok = cap.isOpened()
+    cap.release()
     if not ok:
         rumps.alert(
             title="Camera not accessible",
             message=(
                 "PostureGuard needs camera access.\n\n"
                 "Go to  System Settings → Privacy & Security → Camera\n"
-                "and enable PostureGuard (or Terminal).\n\n"
-                "Then restart the app."
+                "and enable PostureGuard (or Terminal), then restart."
             ),
         )
+    return ok
 
 
-# ── App ────────────────────────────────────────────────────────────────────────
+# ── App ───────────────────────────────────────────────────────────────────────
 
 class PostureGuard(rumps.App):
     """
-    macOS menu bar app that monitors posture in a background thread.
-
-    State machine
-    -------------
-    idle       → user has not calibrated yet
-    calibrating → collecting baseline frames
-    monitoring  → live posture scoring is active
-    paused      → camera loop is sleeping; no analysis or alerts
+    macOS menu bar app.  State machine: idle → calibrating → monitoring ⇄ paused
     """
 
     def __init__(self):
         super().__init__("🧍", quit_button=None)
 
-        # macOS requires the camera permission dialog to appear on the main thread.
-        # __init__ runs before rumps.App.run() so we're still on the main thread here.
-        _preflight_camera()
+        self._settings = Settings()
+        self._cameras  = _detect_cameras()
 
-        # ── Shared state (accessed by both main thread and camera thread) ──
-        self._lock            = threading.Lock()
-        self._score           = 100
-        self._alerts          = []
-        self._calibrated      = False
-        self._calibrating     = False
-        self._paused          = False
-        self._alert_count     = 0
-        self._session_start   = time.time()
-        self._last_tip        = ""
+        _preflight_camera(self._settings.camera_index)
 
-        # Build the initial menu for the "not calibrated" state
+        # ── Shared state (main thread + camera thread) ────────────────────────
+        self._lock              = threading.Lock()
+        self._score             = 100
+        self._alerts            = []
+        self._calibrated        = False
+        self._calibrating       = False
+        self._paused            = False
+        self._alert_count       = 0
+        self._session_start     = time.time()
+        self._last_tip          = ""
+        self._camera_restart    = False
+        self._analyzer          = None   # set by camera loop; shared with live view
+
+        # Phone detection (camera thread only — no lock needed)
+        self._phone_bow_since   = None
+        self._phone_alerted     = False
+
         self._rebuild_menu()
-
-        # Start background threads
         threading.Thread(target=self._camera_loop, daemon=True).start()
         rumps.Timer(self._on_tick, 3).start()
 
-    # ── Menu actions ──────────────────────────────────────────────────────────
+    # ── Posture actions ───────────────────────────────────────────────────────
 
     def _do_calibrate(self, _=None):
         with self._lock:
             if self._calibrating:
-                rumps.alert(
-                    title="Already calibrating",
-                    message="Sit still and hold your best posture — calibration completes in a moment.",
-                )
                 return
             self._calibrating = True
             self._calibrated  = False
-
         self.title = "📐"
         self._rebuild_menu()
         rumps.notification(
             title="PostureGuard — Calibrating",
             subtitle="",
-            message="Hold your best upright posture for 2 seconds.",
+            message=(
+                "Sit in your normal working position and hold still.\n"
+                "Look at the screen you actually work on — not the camera."
+            ),
         )
 
     def _do_pause_toggle(self, _=None):
         with self._lock:
             self._paused = not self._paused
             paused = self._paused
-
         self.title = "⏸" if paused else self._title_for_score()
         self._rebuild_menu()
 
     def _do_show_summary(self, _=None):
         with self._lock:
-            score         = self._score
-            alerts        = list(self._alerts)
-            alert_count   = self._alert_count
-            mins          = round((time.time() - self._session_start) / 60, 1)
-            last_tip      = self._last_tip
-            calibrated    = self._calibrated
+            score       = self._score
+            alerts      = list(self._alerts)
+            count       = self._alert_count
+            mins        = round((time.time() - self._session_start) / 60, 1)
+            last_tip    = self._last_tip
+            calibrated  = self._calibrated
 
         if not calibrated:
             rumps.alert(title="PostureGuard",
-                        message="Not calibrated yet — click Calibrate to start monitoring.")
+                        message="Calibrate first — click '🎯 Calibrate now'.")
             return
 
-        active_issues = (
-            "\n".join(f"  • {a['msg']}" for a in alerts)
-            or "  ✓ None right now"
-        )
-        tip_section = f"\n\nLast coach tip:\n  {last_tip}" if last_tip else ""
-
+        issues = "\n".join(f"  • {a['msg']}" for a in alerts) or "  ✓ None right now"
+        tip    = f"\n\nLast coaching tip:\n  {last_tip}" if last_tip else ""
         rumps.alert(
             title=f"Score: {score} / 100",
             message=(
-                f"Session length:  {mins} min\n"
-                f"Alerts fired:    {alert_count}\n\n"
-                f"Active issues:\n{active_issues}"
-                f"{tip_section}"
+                f"Session:      {mins} min\n"
+                f"Alerts fired: {count}\n\n"
+                f"Active issues:\n{issues}{tip}"
             ),
         )
+
+    def _do_open_dashboard(self, _=None):
+        subprocess.Popen(["open", DASHBOARD_URL])
 
     def _do_quit(self, _=None):
         rumps.quit_application()
 
-    # ── Dynamic menu ──────────────────────────────────────────────────────────
+    def _do_open_live_view(self, _=None):
+        LiveViewWindow.open(self._cameras, self._analyzer or PostureAnalyzer())
+
+    def _do_open_settings(self, _=None):
+        def on_camera_change():
+            with self._lock:
+                self._camera_restart = True
+        SettingsWindow.open(
+            self._settings,
+            self._cameras,
+            on_camera_change    = on_camera_change,
+            label_poses_fn      = self._do_label_poses,
+            apply_labels_fn     = self._do_apply_labels,
+            stats_fn            = self._do_show_label_stats,
+        )
+
+    # ── Calibration Studio (called from the Settings window) ──────────────────
+
+    def _do_label_poses(self, _=None):
+        all_entries = snapshots.all_entries()
+        unlabeled   = [(i, e) for i, e in enumerate(all_entries) if e["label"] is None]
+
+        if not unlabeled:
+            rumps.alert(
+                title="Calibration Studio",
+                message=(
+                    "No unlabeled snapshots yet.\n\n"
+                    "PostureGuard saves a snapshot when you hold a pose for "
+                    f"{SNAPSHOT_STABLE_SECS}+ seconds. Come back after a session."
+                ),
+            )
+            return
+
+        to_label   = unlabeled[-10:]
+        labeled_now = 0
+
+        for global_idx, entry in to_label:
+            feats       = entry.get("features", {})
+            score       = entry["score"]
+            alert_names = entry.get("alerts", [])
+
+            lines = [f"Score at capture: {score} / 100"]
+            if alert_names:
+                from core.posture_analyzer import ALERT_LABELS
+                lines.append("Active signals:")
+                for a in alert_names:
+                    lines.append(f"  • {ALERT_LABELS.get(a, a)}")
+            else:
+                lines.append("No posture signals triggered.")
+            if feats:
+                lines += [
+                    "",
+                    "Raw measurements:",
+                    f"  Head drop:    {feats.get('head_y', 0):+.3f}",
+                    f"  Forward lean: {feats.get('sh_width', 0):.3f}",
+                    f"  Shoulder tilt:{feats.get('sh_tilt', 0):+.3f}",
+                    f"  Head tilt:    {feats.get('ear_tilt', 0):+.1f}°",
+                ]
+            lines.append("\nHow would you label this posture?")
+
+            choice = rumps.alert(
+                title=f"Label pose  ({labeled_now + 1} / {len(to_label)})",
+                message="\n".join(lines),
+                ok="✅  Good posture",
+                cancel="❌  Bad posture",
+                other="⏭  Skip",
+            )
+            if choice == 1:
+                snapshots.set_label(global_idx, "good")
+                labeled_now += 1
+            elif choice == 0:
+                snapshots.set_label(global_idx, "bad")
+                labeled_now += 1
+
+        if labeled_now:
+            rumps.alert(
+                title="Calibration Studio",
+                message=f"Labeled {labeled_now} pose(s). Use 'Apply to model' when you have 10+.",
+            )
+
+    def _do_apply_labels(self, _=None):
+        counts        = snapshots.labeled_counts()
+        total_labeled = counts["good"] + counts["bad"]
+
+        if total_labeled < 10:
+            rumps.alert(
+                title="Not enough data yet",
+                message=f"You have {total_labeled} labeled pose(s). Label at least 10 first.",
+            )
+            return
+
+        adjustments = snapshots.compute_threshold_adjustments()
+        if not adjustments:
+            rumps.alert(title="No adjustments needed",
+                        message="The current thresholds already fit your labeled poses well.")
+            return
+
+        from core.posture_analyzer import (
+            HEAD_DROP_THRESHOLD, SHOULDER_TILT_THRESHOLD,
+            EAR_TILT_THRESHOLD_DEG, FORWARD_LEAN_THRESHOLD,
+        )
+        baseline = {
+            "head_drop": HEAD_DROP_THRESHOLD, "forward_lean": FORWARD_LEAN_THRESHOLD,
+            "shoulder_tilt": SHOULDER_TILT_THRESHOLD, "head_tilt": EAR_TILT_THRESHOLD_DEG,
+        }
+        lines = ["Suggested threshold changes:\n"]
+        for k, mult in adjustments.items():
+            old = baseline.get(k)
+            if old:
+                new = round(old * mult, 4)
+                lines.append(f"  {k}: {old} → {new}  ({'looser ↑' if mult > 1 else 'stricter ↓'})")
+        lines += ["", f"Based on {total_labeled} labeled poses.", "", "Apply?"]
+
+        if rumps.alert(title="Apply label adjustments",
+                       message="\n".join(lines), ok="Apply", cancel="Cancel") == 1:
+            self._settings.set("threshold_multipliers", adjustments)
+            rumps.alert(title="Applied ✓",
+                        message="Saved. Re-calibrate for them to take effect.")
+
+    def _do_show_label_stats(self, _=None):
+        c = snapshots.labeled_counts()
+        rumps.alert(
+            title="Pose label statistics",
+            message=(
+                f"Total snapshots:  {sum(c.values())}\n"
+                f"  ✅ Good:         {c['good']}\n"
+                f"  ❌ Bad:          {c['bad']}\n"
+                f"  ❓ Unsure:       {c['unsure']}\n"
+                f"  ○  Unlabeled:   {c['unlabeled']}"
+            ),
+        )
 
     def _rebuild_menu(self):
-        """
-        Reconstruct the menu to match the current app state.
-        Called on every tick and whenever state changes (calibrate, pause, etc.).
-
-        Menu structure by state
-        -----------------------
-        Not calibrated:
-            ⚪  Not calibrated yet
-            ─────
-            🎯  Calibrate
-            ─────
-            Quit PostureGuard
-
-        Calibrating:
-            📐  Calibrating — sit upright…
-            ─────
-            Quit PostureGuard
-
-        Monitoring (normal):
-            ✅  Score: 92 / 100       (or ⚠️ / 🔴 depending on score)
-            ⏱  12.5 min · 2 alerts
-               ↳ Head dropping forward    (shown only when alerts are active)
-            ─────
-            🎯  Re-calibrate
-            ⏸  Pause monitoring
-            ─────
-            📊  Session Summary
-            ─────
-            Quit PostureGuard
-
-        Paused:
-            ⏸  Monitoring paused
-            ─────
-            ▶  Resume monitoring
-            📊  Session Summary
-            ─────
-            Quit PostureGuard
-        """
+        """Reconstruct menu to match current state. Called every 3 s by the timer."""
         with self._lock:
             calibrated  = self._calibrated
             calibrating = self._calibrating
@@ -209,54 +359,68 @@ class PostureGuard(rumps.App):
             score       = self._score
             alerts      = list(self._alerts)
             count       = self._alert_count
-            mins        = round((time.time() - self._session_start) / 60, 1)
+            mins        = int((time.time() - self._session_start) / 60)
 
         items = []
 
-        # ── Not calibrated ────────────────────────────────────────────────────
+        # ── Header ────────────────────────────────────────────────────────────
+        items += [rumps.MenuItem(f"PostureGuard  v{VERSION}"), None]
+
+        # ── State section ─────────────────────────────────────────────────────
         if calibrating:
             items += [
-                rumps.MenuItem("📐  Calibrating — sit upright…"),
+                rumps.MenuItem("📐  Calibrating…  sit upright & stay still"),
                 None,
             ]
 
         elif not calibrated:
             items += [
                 rumps.MenuItem("⚪  Not calibrated yet"),
+                rumps.MenuItem("    Sit upright and click Calibrate to start."),
                 None,
-                rumps.MenuItem("🎯  Calibrate", callback=self._do_calibrate),
+                rumps.MenuItem("🎯  Calibrate now", callback=self._do_calibrate),
                 None,
             ]
 
-        # ── Paused ────────────────────────────────────────────────────────────
         elif paused:
             items += [
                 rumps.MenuItem("⏸  Monitoring paused"),
+                rumps.MenuItem(f"    Session: {mins} min  ·  {count} alert(s)"),
                 None,
-                rumps.MenuItem("▶  Resume monitoring", callback=self._do_pause_toggle),
-                rumps.MenuItem("📊  Session Summary",   callback=self._do_show_summary),
+                rumps.MenuItem("▶  Resume monitoring",  callback=self._do_pause_toggle),
+                None,
+                rumps.MenuItem("📋  Session Summary",   callback=self._do_show_summary),
+                rumps.MenuItem("📷  Live View",         callback=self._do_open_live_view),
+                rumps.MenuItem("🌐  Open Dashboard",    callback=self._do_open_dashboard),
                 None,
             ]
 
-        # ── Active monitoring ─────────────────────────────────────────────────
         else:
-            score_icon = "✅" if score >= 80 else "⚠️" if score >= 60 else "🔴"
-            items.append(rumps.MenuItem(f"{score_icon}  Score: {score} / 100"))
-            items.append(rumps.MenuItem(f"⏱  {mins} min  ·  {count} alert(s)"))
-
-            for alert in alerts[:3]:  # show up to 3 active issues
-                items.append(rumps.MenuItem(f"   ↳ {alert['msg']}"))
-
+            icon  = "🟢" if score >= 80 else "🟡" if score >= 60 else "🔴"
+            label = "Good posture" if score >= 80 else "Slouching a bit" if score >= 60 else "Poor posture"
+            items += [
+                rumps.MenuItem(f"{icon}  {label}  —  {score} / 100"),
+                rumps.MenuItem(f"    Session: {mins} min  ·  {count} alert(s)"),
+            ]
+            if alerts:
+                items.append(None)
+                for a in alerts[:3]:
+                    items.append(rumps.MenuItem(f"   ⚠  {a['msg']}"))
             items += [
                 None,
-                rumps.MenuItem("🎯  Re-calibrate",      callback=self._do_calibrate),
-                rumps.MenuItem("⏸  Pause monitoring",   callback=self._do_pause_toggle),
+                rumps.MenuItem("🎯  Re-calibrate",     callback=self._do_calibrate),
+                rumps.MenuItem("⏸  Pause monitoring",  callback=self._do_pause_toggle),
                 None,
-                rumps.MenuItem("📊  Session Summary",    callback=self._do_show_summary),
+                rumps.MenuItem("📋  Session Summary",  callback=self._do_show_summary),
+                rumps.MenuItem("📷  Live View",        callback=self._do_open_live_view),
+                rumps.MenuItem("🌐  Open Dashboard",   callback=self._do_open_dashboard),
                 None,
             ]
 
-        items.append(rumps.MenuItem("Quit PostureGuard", callback=self._do_quit))
+        # ── Settings + Quit ───────────────────────────────────────────────────
+        items.append(rumps.MenuItem("⚙️  Settings…", callback=self._do_open_settings))
+        items.append(None)
+        items.append(rumps.MenuItem("✕  Quit PostureGuard", callback=self._do_quit))
 
         self.menu.clear()
         self.menu = items
@@ -264,12 +428,10 @@ class PostureGuard(rumps.App):
     # ── Tick ──────────────────────────────────────────────────────────────────
 
     def _on_tick(self, _):
-        """Update the menu bar title and rebuild the menu every 3 seconds."""
         with self._lock:
             calibrating = self._calibrating
             calibrated  = self._calibrated
             paused      = self._paused
-
         if calibrating:
             self.title = "📐"
         elif paused:
@@ -278,11 +440,9 @@ class PostureGuard(rumps.App):
             self.title = self._title_for_score()
         else:
             self.title = "🧍"
-
         self._rebuild_menu()
 
     def _title_for_score(self) -> str:
-        """Return the menu bar title string based on the current score."""
         with self._lock:
             score = self._score
         icon = "🟢" if score >= 80 else "🟡" if score >= 60 else "🔴"
@@ -290,26 +450,58 @@ class PostureGuard(rumps.App):
 
     # ── Camera loop ───────────────────────────────────────────────────────────
 
-    def _camera_loop(self):
-        """Daemon thread: reads frames, runs pose detection, updates state."""
-        detector  = PoseDetector()
-        analyzer  = PostureAnalyzer()
-        alert_mgr = AlertManager()
+    def _open_cameras(self) -> list:
+        s = self._settings
+        indices = [s.camera_index]
+        if s.use_all_cameras:
+            indices = list({s.camera_index} | {cv_idx for cv_idx, _ in self._cameras})
+        caps = []
+        for i in sorted(set(indices)):
+            cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                caps.append(cap)
+        return caps
 
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            rumps.notification(
-                "PostureGuard", "Camera Error",
-                "Cannot open camera. Grant camera access and restart."
-            )
+    def _camera_loop(self):
+        """Background thread: reads frames, runs pose detection, updates shared state."""
+        detector   = PoseDetector()
+        analyzer   = PostureAnalyzer()
+        self._analyzer = analyzer   # share with live view (main thread reads after calibration)
+        alert_mgr  = AlertManager(
+            trigger_seconds=self._settings.alert_threshold_seconds
+        )
+        smooth_buf         = deque(maxlen=SMOOTH_WINDOW)
+        cal_count          = 0
+        last_snapshot      = time.time()
+        stable_score_ref   = 100      # score when current stable window started
+        stable_since       = None     # time when score became stable
+
+        caps = self._open_cameras()
+        if not caps:
+            rumps.notification("PostureGuard", "Camera Error",
+                               "Cannot open camera. Grant access and restart.")
             return
 
-        smooth_buf = deque(maxlen=SMOOTH_WINDOW)
-        cal_count  = 0
-
         while True:
+            # Reload cameras if settings changed
             with self._lock:
-                paused     = self._paused
+                do_restart = self._camera_restart
+            if do_restart:
+                for c in caps:
+                    c.release()
+                with self._lock:
+                    self._camera_restart = False
+                    # Also recreate alert manager with updated threshold
+                    alert_mgr = AlertManager(
+                        trigger_seconds=self._settings.alert_threshold_seconds
+                    )
+                caps = self._open_cameras()
+                if not caps:
+                    time.sleep(1)
+                    continue
+
+            with self._lock:
+                paused      = self._paused
                 calibrating = self._calibrating
                 calibrated  = self._calibrated
 
@@ -317,13 +509,17 @@ class PostureGuard(rumps.App):
                 time.sleep(0.5)
                 continue
 
-            ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.1)
-                continue
-
-            frame = cv2.flip(frame, 1)
-            landmarks, _ = detector.process(frame)
+            # Read from each camera; use first frame that gives valid landmarks
+            landmarks = None
+            for cap in caps:
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+                frame = cv2.flip(frame, 1)
+                lm, _ = detector.process(frame)
+                if lm:
+                    landmarks = lm
+                    break
 
             if not landmarks:
                 time.sleep(0.033)
@@ -334,16 +530,36 @@ class PostureGuard(rumps.App):
             elif calibrated:
                 self._analyse_frame(analyzer, alert_mgr, smooth_buf, landmarks)
 
+                # Stable-pose snapshot for Calibration Studio:
+                # only save when score hasn't jumped more than 8 pts for 15+ seconds
+                now = time.time()
+                with self._lock:
+                    cur_score  = self._score
+                    cur_alerts = list(self._alerts)
+
+                if abs(cur_score - stable_score_ref) > 8:
+                    stable_score_ref = cur_score
+                    stable_since     = now
+                elif stable_since is None:
+                    stable_since = now
+
+                stable_secs = now - stable_since if stable_since else 0
+                if (stable_secs >= SNAPSHOT_STABLE_SECS
+                        and now - last_snapshot >= SNAPSHOT_MIN_INTERVAL):
+                    feats = analyzer._features(landmarks)
+                    if feats:
+                        snapshots.save_snapshot(cur_score, cur_alerts, feats)
+                    last_snapshot = now
+
             time.sleep(0.033)
 
-        cap.release()
+        for c in caps:
+            c.release()
         detector.close()
 
     def _calibrate_frame(self, analyzer, landmarks, cal_count: int) -> int:
-        """Feed one frame into the calibration buffer. Finalises when count reaches target."""
         analyzer.add_calibration_frame(landmarks)
         cal_count += 1
-
         if cal_count >= CALIBRATION_FRAMES:
             analyzer.commit_calibration()
             with self._lock:
@@ -355,11 +571,9 @@ class PostureGuard(rumps.App):
                 message="Baseline saved. I'll alert you when you slouch.",
             )
             return 0
-
         return cal_count
 
     def _analyse_frame(self, analyzer, alert_mgr, smooth_buf, landmarks):
-        """Run posture analysis and fire notifications if needed."""
         score, alerts = analyzer.analyze(landmarks)
         smooth_buf.append(score)
         smoothed = int(sum(smooth_buf) / len(smooth_buf))
@@ -368,8 +582,8 @@ class PostureGuard(rumps.App):
             self._score  = smoothed
             self._alerts = alerts
 
+        # Posture alerts
         result = alert_mgr.update(smoothed, alerts)
-
         if result.warn:
             tip = get_coaching_tip(alerts, result.duration)
             with self._lock:
@@ -380,19 +594,52 @@ class PostureGuard(rumps.App):
                 subtitle="Posture check",
                 message=tip,
             )
-
         elif result.restored:
             rumps.notification(
                 title="PostureGuard 🧍",
-                subtitle="Posture restored",
+                subtitle="Posture restored ✓",
                 message="Good job — back on track! 💪",
             )
+
+        # Phone posture detection
+        if self._settings.phone_detection_enabled:
+            self._check_phone_posture(analyzer, landmarks)
+
+    def _check_phone_posture(self, analyzer, landmarks):
+        if analyzer.baseline is None:
+            return
+        feats = analyzer._features(landmarks)
+        if feats is None:
+            self._phone_bow_since = None
+            self._phone_alerted   = False
+            return
+
+        head_dev = feats["head_y"] - analyzer.baseline["head_y"]
+
+        if head_dev > PHONE_HEAD_DROP_THRESHOLD:
+            if self._phone_bow_since is None:
+                self._phone_bow_since = time.time()
+                self._phone_alerted   = False
+
+            elapsed_min = (time.time() - self._phone_bow_since) / 60
+            if elapsed_min >= self._settings.phone_alert_minutes and not self._phone_alerted:
+                self._phone_alerted = True
+                rumps.notification(
+                    title="PostureGuard 📱",
+                    subtitle="Phone check",
+                    message=(
+                        f"You've been looking down for {int(elapsed_min)} min. "
+                        "Put the phone down and sit up! 🙏"
+                    ),
+                )
+        else:
+            self._phone_bow_since = None
+            self._phone_alerted   = False
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
-    """Called by the  postureguard  console script installed by pip / Homebrew."""
     PostureGuard().run()
 
 
