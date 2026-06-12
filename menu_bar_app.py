@@ -27,7 +27,7 @@ from ui.settings_window import SettingsWindow
 from ui.live_view_window import LiveViewWindow
 from ui.label_window import LabelWindow
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DASHBOARD_URL = "http://127.0.0.1:5000"
 CALIBRATION_FRAMES = 60
 SMOOTH_WINDOW = 8
