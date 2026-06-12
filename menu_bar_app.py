@@ -478,9 +478,9 @@ class PostureGuard(rumps.App):
                 time.sleep(0.5)
                 continue
 
-            # Read from each camera; use first frame that gives valid landmarks
-            landmarks     = None
-            current_frame = None
+            # Read all cameras; if calibrated pick the one with the highest
+            # posture score so a badly-angled camera doesn't drag the reading down
+            candidates = []
             for cap in caps:
                 ret, frame = cap.read()
                 if not ret:
@@ -488,9 +488,18 @@ class PostureGuard(rumps.App):
                 frame = cv2.flip(frame, 1)
                 lm, _ = detector.process(frame)
                 if lm:
-                    landmarks     = lm
-                    current_frame = frame
-                    break
+                    candidates.append((lm, frame))
+
+            if not candidates:
+                time.sleep(0.033)
+                continue
+
+            if calibrated and analyzer.baseline and len(candidates) > 1:
+                landmarks, current_frame = max(
+                    candidates, key=lambda c: analyzer.analyze(c[0])[0]
+                )
+            else:
+                landmarks, current_frame = candidates[0]
 
             if not landmarks:
                 time.sleep(0.033)

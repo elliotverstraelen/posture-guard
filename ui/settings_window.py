@@ -13,9 +13,12 @@ from AppKit import (
 )
 from Foundation import NSObject
 
+import core.snapshot_store as _snapshot_store
+
 _W   = 440
 _PAD = 24
 _ROW = 26   # standard row height
+_MIN_LABELS = 10   # labels required before "Improve model" is enabled
 
 
 class _SettingsCtrl(NSObject):
@@ -200,26 +203,42 @@ def _build(ctrl, settings, cameras) -> NSWindow:
     # ── Calibration Studio ────────────────────────────────────────────────────
     y = _heading(cv, "🎓  Calibration Studio", y)
 
-    note = NSTextField.labelWithString_(
-        "Snapshots are saved when you hold a pose for 15+ seconds. "
-        "Label them to personalise your detection thresholds."
-    )
-    note.setFrame_(NSMakeRect(_PAD, y - 36, _W - 2*_PAD, 32))
+    counts  = _snapshot_store.labeled_counts()
+    n_labeled = counts.get("good", 0) + counts.get("bad", 0) + counts.get("unsure", 0)
+    n_unlabeled = counts.get("unlabeled", 0)
+    n_total = n_labeled + n_unlabeled
+    remaining = max(0, _MIN_LABELS - n_labeled)
+
+    if n_total == 0:
+        note_text = ("No snapshots yet. Hold a pose for 15+ seconds and "
+                     "PostureGuard will save it for labeling.")
+    elif remaining > 0:
+        note_text = (f"{n_labeled} pose{'s' if n_labeled != 1 else ''} labeled "
+                     f"({n_unlabeled} unlabeled) — "
+                     f"{remaining} more label{'s' if remaining != 1 else ''} needed "
+                     f"to improve the model.")
+    else:
+        note_text = (f"{n_labeled} poses labeled ({n_unlabeled} unlabeled). "
+                     "Model can be improved with your data.")
+
+    note = NSTextField.labelWithString_(note_text)
+    note.setFrame_(NSMakeRect(_PAD, y - 40, _W - 2*_PAD, 36))
     note.setFont_(NSFont.systemFontOfSize_(11))
     note.setTextColor_(NSColor.secondaryLabelColor())
     note.cell().setWraps_(True)
     cv.addSubview_(note)
-    y -= 48
+    y -= 52
 
     bw = (_W - 2*_PAD - 16) // 3
-    for i, (title, sel_str) in enumerate([
-        ("🏷  Label poses",      "labelPoses:"),
-        ("🔬  Improve model",    "applyLabels:"),   # renamed — not a generic "Apply"
-        ("📊  Statistics",       "showStats:"),
+    for i, (title, sel_str, enabled) in enumerate([
+        ("🏷  Label poses",   "labelPoses:",  n_unlabeled > 0 or n_total == 0),
+        ("🔬  Improve model", "applyLabels:", n_labeled >= _MIN_LABELS),
+        ("📊  Statistics",    "showStats:",   True),
     ]):
         btn = _btn(cv, title, _PAD + i * (bw + 8), y - 30, bw, 28)
         btn.setTarget_(ctrl)
         btn.setAction_(sel_str)
+        btn.setEnabled_(enabled)
     y -= 42
 
     # ── Done button ───────────────────────────────────────────────────────────
