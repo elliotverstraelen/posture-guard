@@ -24,7 +24,7 @@ jobs:
           pip install -r requirements-menubar.txt py2app
 
       - name: Build .app bundle
-        run: python setup.py py2app
+        run: VERSION="${{ github.ref_name }}" python setup.py py2app
 
       - name: Zip the .app
         run: |

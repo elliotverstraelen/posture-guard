@@ -2,18 +2,18 @@
 py2app build script for PostureGuard menu bar app.
 
 Usage:
-    pip install py2app
-    python setup.py py2app
+    .venv/bin/pip install py2app
+    .venv/bin/python setup.py py2app
     open dist/PostureGuard.app
 """
 
+import os
 from setuptools import setup
 
+# Use $VERSION env var set by the release workflow, else fall back to pyproject version
+version = os.environ.get("VERSION", "1.0.0").lstrip("v")
+
 APP = ["menu_bar_app.py"]
-DATA_FILES = [
-    ("templates", ["templates/index.html"]),
-    ("static/js", ["static/js/dashboard.js"]),
-]
 OPTIONS = {
     "argv_emulation": False,
     "packages": [
@@ -22,17 +22,15 @@ OPTIONS = {
         "rumps",
         "numpy",
         "requests",
-        "flask",
-        "transformers",
         "core",
         "ai",
     ],
-    "includes": ["notifications"],
     "plist": {
         "CFBundleName": "PostureGuard",
         "CFBundleDisplayName": "PostureGuard",
-        "CFBundleVersion": "1.0.0",
-        "LSUIElement": True,  # hides dock icon — true background/menu-bar app
+        "CFBundleVersion": version,
+        "CFBundleShortVersionString": version,
+        "LSUIElement": True,  # hides dock icon — menu-bar-only app
         "NSCameraUsageDescription": (
             "PostureGuard needs camera access to monitor your posture in real time."
         ),
@@ -42,7 +40,6 @@ OPTIONS = {
 setup(
     name="PostureGuard",
     app=APP,
-    data_files=DATA_FILES,
     options={"py2app": OPTIONS},
     setup_requires=["py2app"],
 )
