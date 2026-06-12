@@ -1,4 +1,9 @@
+import json
+from pathlib import Path
+
 import numpy as np
+
+_BASELINE_PATH = Path.home() / ".config" / "postureguard" / "baseline.json"
 
 # Landmark indices (mediapipe.solutions.pose.PoseLandmark values)
 _NOSE = 0
@@ -32,8 +37,8 @@ ALERT_LABELS = {
 
 class PostureAnalyzer:
     def __init__(self):
-        self.baseline = None
         self._cal_buffer = []
+        self.baseline    = self._load_baseline()   # restore saved calibration if it exists
 
     # ------------------------------------------------------------------
     # Calibration
@@ -52,10 +57,30 @@ class PostureAnalyzer:
             k: float(np.mean([f[k] for f in self._cal_buffer])) for k in keys
         }
         self._cal_buffer = []
+        self._save_baseline()
         return True
 
     def calibrated(self):
         return self.baseline is not None
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def _save_baseline(self):
+        _BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_BASELINE_PATH, "w") as f:
+            json.dump(self.baseline, f, indent=2)
+
+    @staticmethod
+    def _load_baseline():
+        if _BASELINE_PATH.exists():
+            try:
+                with open(_BASELINE_PATH) as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return None
 
     # ------------------------------------------------------------------
     # Analysis

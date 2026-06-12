@@ -25,6 +25,7 @@ from core.posture_analyzer import PostureAnalyzer
 import core.snapshot_store as snapshots
 from ui.settings_window import SettingsWindow
 from ui.live_view_window import LiveViewWindow
+from ui.label_window import LabelWindow
 
 VERSION = "1.1.0"
 DASHBOARD_URL = "http://127.0.0.1:5000"
@@ -251,52 +252,15 @@ class PostureGuard(rumps.App):
             )
             return
 
-        to_label   = unlabeled[-10:]
-        labeled_now = 0
+        def on_complete(labeled_count):
+            if labeled_count:
+                rumps.notification(
+                    title="Calibration Studio",
+                    subtitle="",
+                    message=f"Labeled {labeled_count} pose(s). Use '🔬 Improve model' when you have 10+.",
+                )
 
-        for global_idx, entry in to_label:
-            feats       = entry.get("features", {})
-            score       = entry["score"]
-            alert_names = entry.get("alerts", [])
-
-            lines = [f"Score at capture: {score} / 100"]
-            if alert_names:
-                from core.posture_analyzer import ALERT_LABELS
-                lines.append("Active signals:")
-                for a in alert_names:
-                    lines.append(f"  • {ALERT_LABELS.get(a, a)}")
-            else:
-                lines.append("No posture signals triggered.")
-            if feats:
-                lines += [
-                    "",
-                    "Raw measurements:",
-                    f"  Head drop:    {feats.get('head_y', 0):+.3f}",
-                    f"  Forward lean: {feats.get('sh_width', 0):.3f}",
-                    f"  Shoulder tilt:{feats.get('sh_tilt', 0):+.3f}",
-                    f"  Head tilt:    {feats.get('ear_tilt', 0):+.1f}°",
-                ]
-            lines.append("\nHow would you label this posture?")
-
-            choice = rumps.alert(
-                title=f"Label pose  ({labeled_now + 1} / {len(to_label)})",
-                message="\n".join(lines),
-                ok="✅  Good posture",
-                cancel="❌  Bad posture",
-                other="⏭  Skip",
-            )
-            if choice == 1:
-                snapshots.set_label(global_idx, "good")
-                labeled_now += 1
-            elif choice == 0:
-                snapshots.set_label(global_idx, "bad")
-                labeled_now += 1
-
-        if labeled_now:
-            rumps.alert(
-                title="Calibration Studio",
-                message=f"Labeled {labeled_now} pose(s). Use 'Apply to model' when you have 10+.",
-            )
+        LabelWindow.open(unlabeled[-10:], on_complete=on_complete)
 
     def _do_apply_labels(self, _=None):
         counts        = snapshots.labeled_counts()
@@ -466,7 +430,12 @@ class PostureGuard(rumps.App):
         """Background thread: reads frames, runs pose detection, updates shared state."""
         detector   = PoseDetector()
         analyzer   = PostureAnalyzer()
-        self._analyzer = analyzer   # share with live view (main thread reads after calibration)
+        self._analyzer = analyzer
+
+        # If a saved baseline exists, restore calibrated state immediately
+        if analyzer.baseline:
+            with self._lock:
+                self._calibrated = True
         alert_mgr  = AlertManager(
             trigger_seconds=self._settings.alert_threshold_seconds
         )
@@ -510,7 +479,8 @@ class PostureGuard(rumps.App):
                 continue
 
             # Read from each camera; use first frame that gives valid landmarks
-            landmarks = None
+            landmarks     = None
+            current_frame = None
             for cap in caps:
                 ret, frame = cap.read()
                 if not ret:
@@ -518,7 +488,8 @@ class PostureGuard(rumps.App):
                 frame = cv2.flip(frame, 1)
                 lm, _ = detector.process(frame)
                 if lm:
-                    landmarks = lm
+                    landmarks     = lm
+                    current_frame = frame
                     break
 
             if not landmarks:
@@ -548,7 +519,8 @@ class PostureGuard(rumps.App):
                         and now - last_snapshot >= SNAPSHOT_MIN_INTERVAL):
                     feats = analyzer._features(landmarks)
                     if feats:
-                        snapshots.save_snapshot(cur_score, cur_alerts, feats)
+                        snapshots.save_snapshot(cur_score, cur_alerts, feats,
+                                                frame=current_frame)
                     last_snapshot = now
 
             time.sleep(0.033)

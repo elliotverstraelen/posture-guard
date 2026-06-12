@@ -14,14 +14,29 @@ _PATH = Path.home() / ".config" / "postureguard" / "snapshots.json"
 _MAX_ENTRIES = 200   # keep the last 200 snapshots
 
 
-def save_snapshot(score: int, alerts: list, features: dict):
+_IMAGES_DIR = Path.home() / ".config" / "postureguard" / "snapshots"
+
+
+def save_snapshot(score: int, alerts: list, features: dict, frame=None):
+    """Save a pose snapshot.  Pass `frame` (numpy BGR) to store a thumbnail."""
+    import cv2 as _cv2
+    ts = time.time()
+    image_path = None
+
+    if frame is not None:
+        _IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+        img_path = _IMAGES_DIR / f"pose_{int(ts)}.jpg"
+        _cv2.imwrite(str(img_path), frame)
+        image_path = str(img_path)
+
     entries = _load()
     entries.append({
-        "ts":       time.time(),
+        "ts":       ts,
         "score":    score,
         "alerts":   [a["type"] for a in alerts],
         "features": {k: round(v, 4) for k, v in features.items()},
         "label":    None,
+        "image":    image_path,
     })
     _write(entries[-_MAX_ENTRIES:])
 
