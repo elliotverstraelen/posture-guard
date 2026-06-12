@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"   # triggers on  git tag v1.0.0 && git push --tags
+
+jobs:
+  release:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt py2app
+
+      - name: Build .app bundle
+        run: python setup.py py2app
+
+      - name: Zip the .app
+        run: |
+          cd dist
+          zip -r PostureGuard-${{ github.ref_name }}-macOS.zip PostureGuard.app
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "PostureGuard ${{ github.ref_name }}"
+          body: |
+            ## PostureGuard ${{ github.ref_name }}
+
+            ### Install
+
+            Download **PostureGuard-${{ github.ref_name }}-macOS.zip**, unzip it,
+            and drag `PostureGuard.app` to your Applications folder.
+
+            On first launch macOS will ask for camera permission — click OK.
+
+            ### Requirements
+            - macOS 12 or later
+            - [Ollama](https://ollama.ai) (optional — app works without it using fallback tips)
+
+            ### What's changed
+            See [CHANGELOG](https://github.com/elliotverstraelen/posture-guard/blob/main/CHANGELOG.md)
+          files: dist/PostureGuard-${{ github.ref_name }}-macOS.zip
+          generate_release_notes: true
