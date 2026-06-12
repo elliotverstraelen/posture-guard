@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "postureguard"
+version = "1.0.0"
+description = "Real-time macOS posture monitor in the menu bar"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+keywords = ["posture", "mediapipe", "macos", "menubar", "health"]
+
+# Base install = menu bar app only (what Homebrew installs)
+dependencies = [
+    "mediapipe==0.10.14",
+    "opencv-python",
+    "rumps",
+    "numpy",
+    "requests",
+]
+
+[project.optional-dependencies]
+# pip install postureguard[dashboard]  →  also installs the Flask web dashboard
+dashboard = [
+    "flask",
+    "transformers",
+    "torch",
+]
+
+[project.scripts]
+# `postureguard` command → launches the menu bar app
+postureguard = "menu_bar_app:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "ai*"]

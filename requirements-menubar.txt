@@ -1,0 +1,7 @@
+# Minimal dependencies for the native menu bar app (used by Homebrew formula).
+# No Flask, no HuggingFace/torch — keeps the install small and fast.
+mediapipe==0.10.14
+opencv-python
+rumps
+numpy
+requests

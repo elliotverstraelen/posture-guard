@@ -1,16 +1,19 @@
 """
-PostureGuard — Phase 2 (bonus)
-Native macOS menu bar app using rumps.
+PostureGuard — native macOS menu bar app.
 
-The app lives in the menu bar (no dock icon).
-The menu updates every 3 seconds to reflect the current monitoring state.
+Lives in the menu bar with no dock icon.
+The menu updates every 3 seconds to reflect the current state.
 
-Run:
-    pip install rumps
-    python menu_bar_app.py
+Run (development):
+    .venv/bin/python menu_bar_app.py
+
+Install via Homebrew:
+    brew tap elliotverstraelen/postureguard
+    brew install postureguard
+    postureguard
 
 Package as a standalone .app:
-    pip install py2app
+    .venv/bin/pip install py2app
     python setup.py py2app
     open dist/PostureGuard.app
 """
@@ -33,6 +36,30 @@ CALIBRATION_FRAMES = 60
 SMOOTH_WINDOW      = 8
 
 
+# ── Camera permission pre-flight ───────────────────────────────────────────────
+
+def _preflight_camera() -> None:
+    """
+    Trigger the macOS 'wants to access your camera' dialog.
+    Must be called from the main thread — background threads can't show it.
+    For the menu bar app, call this inside __init__ (before run() starts the
+    NSApplication event loop).
+    """
+    test = cv2.VideoCapture(0)
+    ok = test.isOpened()
+    test.release()
+    if not ok:
+        rumps.alert(
+            title="Camera not accessible",
+            message=(
+                "PostureGuard needs camera access.\n\n"
+                "Go to  System Settings → Privacy & Security → Camera\n"
+                "and enable PostureGuard (or Terminal).\n\n"
+                "Then restart the app."
+            ),
+        )
+
+
 # ── App ────────────────────────────────────────────────────────────────────────
 
 class PostureGuard(rumps.App):
@@ -49,6 +76,10 @@ class PostureGuard(rumps.App):
 
     def __init__(self):
         super().__init__("🧍", quit_button=None)
+
+        # macOS requires the camera permission dialog to appear on the main thread.
+        # __init__ runs before rumps.App.run() so we're still on the main thread here.
+        _preflight_camera()
 
         # ── Shared state (accessed by both main thread and camera thread) ──
         self._lock            = threading.Lock()
@@ -360,5 +391,10 @@ class PostureGuard(rumps.App):
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def main():
+    """Called by the  postureguard  console script installed by pip / Homebrew."""
     PostureGuard().run()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,7 +1,11 @@
-# mediapipe 0.10.15+ dropped mp.solutions on some platforms — pin to last known-good version
+# Full development dependencies (Flask dashboard + menu bar app + HuggingFace session report).
+# For the Homebrew / menu-bar-only install use requirements-menubar.txt instead.
+#
+# mediapipe 0.10.15+ dropped mp.solutions on some platforms — pin to last known-good version.
 mediapipe==0.10.14
 opencv-python
 flask
+rumps
 requests
 numpy
 transformers
