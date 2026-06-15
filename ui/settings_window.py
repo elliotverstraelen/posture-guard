@@ -3,6 +3,8 @@ Native macOS settings panel for PostureGuard.
 Frosted-glass NSWindow.  Settings save the moment you change them.
 """
 
+import subprocess
+
 import objc
 from AppKit import (
     NSApp, NSBackingStoreBuffered, NSBox, NSButton, NSColor,
@@ -36,6 +38,12 @@ class _SettingsCtrl(NSObject):
         self._alert_field      = None
 
     # ── Obj-C actions (no @python_method — must be real selectors) ────────────
+
+    def openCameraPermissions_(self, sender):
+        subprocess.Popen([
+            "open",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera",
+        ])
 
     def cameraChanged_(self, sender):
         idx = sender.indexOfSelectedItem()
@@ -120,7 +128,7 @@ class SettingsWindow:
 
 
 def _build(ctrl, settings, cameras) -> NSWindow:
-    H = 540
+    H = 574
     win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
         NSMakeRect(0, 0, _W, H),
         (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
@@ -163,7 +171,14 @@ def _build(ctrl, settings, cameras) -> NSWindow:
                        y=y, checked=settings.use_all_cameras)
     cb_all.setTarget_(ctrl)
     cb_all.setAction_("allCamerasToggled:")
-    y -= 32
+    y -= 30
+
+    perm_btn = _btn(cv, "🔒  Camera Permissions…", _PAD, y - 24, 180, 22)
+    perm_btn.setBezelStyle_(2)   # rounded rect — smaller than the default push button
+    perm_btn.setFont_(NSFont.systemFontOfSize_(11))
+    perm_btn.setTarget_(ctrl)
+    perm_btn.setAction_("openCameraPermissions:")
+    y -= 34
 
     _sep(cv, y - 6)
     y -= 20
