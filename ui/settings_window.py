@@ -45,6 +45,12 @@ class _SettingsCtrl(NSObject):
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera",
         ])
 
+    def openNotificationPermissions_(self, sender):
+        subprocess.Popen([
+            "open",
+            "x-apple.systempreferences:com.apple.preference.notifications",
+        ])
+
     def cameraChanged_(self, sender):
         idx = sender.indexOfSelectedItem()
         if 0 <= idx < len(self._cameras):
@@ -128,7 +134,7 @@ class SettingsWindow:
 
 
 def _build(ctrl, settings, cameras) -> NSWindow:
-    H = 574
+    H = 608
     win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
         NSMakeRect(0, 0, _W, H),
         (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
@@ -185,6 +191,14 @@ def _build(ctrl, settings, cameras) -> NSWindow:
 
     # ── Notifications ─────────────────────────────────────────────────────────
     y = _heading(cv, "🔔  Notifications", y)
+
+    notif_btn = _btn(cv, "🔔  Notification Permissions…", _PAD, y - 24, 200, 22)
+    notif_btn.setBezelStyle_(2)
+    notif_btn.setFont_(NSFont.systemFontOfSize_(11))
+    notif_btn.setTarget_(ctrl)
+    notif_btn.setAction_("openNotificationPermissions:")
+    cv.addSubview_(notif_btn)
+    y -= 34
 
     cb_phone = _checkbox(cv, "Phone detection  —  alert when looking down too long",
                          y=y, checked=settings.phone_detection_enabled)
