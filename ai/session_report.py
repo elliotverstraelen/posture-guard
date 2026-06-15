@@ -1,10 +1,8 @@
 """
-HuggingFace integration — zero-shot classification of posture session quality.
+Session quality classification using HuggingFace zero-shot classification.
 
-Used at the end of a session (or every 10 minutes) to categorise how the session
-went. The result appears on the dashboard as a session summary badge.
-
-Loads lazily on first call so it does not block app startup.
+Uses facebook/bart-large-mnli to categorise a posture session from a short
+text summary of the session stats. Loaded lazily so startup isn't blocked.
 """
 
 from __future__ import annotations

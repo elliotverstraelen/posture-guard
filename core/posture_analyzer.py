@@ -1,3 +1,14 @@
+"""
+Posture analysis: feature extraction, personal calibration, and deviation scoring.
+
+Flow: extract 5 geometric features from MediaPipe landmarks → compare against a
+personal baseline built during calibration → compute a 0-100 score based on how
+far each feature deviates from that baseline.
+
+All positional features are normalised by shoulder width so the readings don't
+shift when the user sits closer or further from the camera.
+"""
+
 import json
 from pathlib import Path
 
@@ -5,25 +16,26 @@ import numpy as np
 
 _BASELINE_PATH = Path.home() / ".config" / "postureguard" / "baseline.json"
 
-# Landmark indices (mediapipe.solutions.pose.PoseLandmark values)
+# MediaPipe Pose landmark indices (from mediapipe.solutions.pose.PoseLandmark)
 _NOSE = 0
 _LEFT_EAR = 7
 _RIGHT_EAR = 8
 _LEFT_SHOULDER = 11
 _RIGHT_SHOULDER = 12
 
-# Deviation thresholds (all normalised relative to shoulder width unless noted)
-HEAD_DROP_THRESHOLD = 0.12
-SHOULDER_TILT_THRESHOLD = 0.06
-EAR_TILT_THRESHOLD_DEG = 12.0  # raised from 8° — ear landmarks are noisy when hair covers ears
-FORWARD_LEAN_THRESHOLD = 0.07
+# Deviation thresholds — all normalised relative to shoulder width except ear_tilt (degrees)
+HEAD_DROP_THRESHOLD     = 0.12   # nose descends toward shoulder midpoint
+SHOULDER_TILT_THRESHOLD = 0.06   # vertical asymmetry between left and right shoulder
+EAR_TILT_THRESHOLD_DEG  = 12.0   # angle of the ear line vs horizontal; raised from 8° because
+                                  # hair and low-visibility frames make ear landmarks noisy
+FORWARD_LEAN_THRESHOLD  = 0.07   # shoulder width increases as user leans toward camera
 
-# Score deduction per fully-triggered alert
+# Score deductions per fully-triggered alert (scaled by severity 0.5–1.0)
 _DEDUCTIONS = {
-    "head_drop": 35,
-    "forward_lean": 25,
+    "head_drop":     35,
+    "forward_lean":  25,
     "shoulder_tilt": 20,
-    "head_tilt": 10,  # reduced — head tilt detection is inherently noisier than other signals
+    "head_tilt":     10,  # lower weight — ear-landmark noise makes this signal less reliable
 }
 
 # Human-readable labels for the UI / coach
@@ -88,10 +100,13 @@ class PostureAnalyzer:
 
     def analyze(self, landmarks):
         """
-        Returns
-        -------
-        score : int  (0–100)
-        alerts : list of dicts  {'type': str, 'msg': str, 'severity': float}
+        Score the current frame against the personal baseline.
+
+        Severity formula: clamp((deviation - threshold) / threshold + 0.5, 0.5, 1.0)
+        Crossing the threshold = 0.5 severity; double the threshold = 1.0.
+        This gives a smooth gradient so minor deviations score lightly.
+
+        Returns (score: int 0-100, alerts: list of dicts)
         """
         if self.baseline is None:
             return 100, []
@@ -103,28 +118,28 @@ class PostureAnalyzer:
         alerts = []
         score = 100
 
-        # 1. Head drop — nose descends toward shoulder line
+        # 1. Head drop — nose descends toward shoulder line (bad posture = positive delta)
         head_y_dev = curr["head_y"] - self.baseline["head_y"]
         if head_y_dev > HEAD_DROP_THRESHOLD:
             sev = min((head_y_dev - HEAD_DROP_THRESHOLD) / HEAD_DROP_THRESHOLD + 0.5, 1.0)
             alerts.append({"type": "head_drop", "msg": ALERT_LABELS["head_drop"], "severity": round(sev, 2)})
             score -= int(_DEDUCTIONS["head_drop"] * sev)
 
-        # 2. Shoulder asymmetry — one shoulder higher than the other
+        # 2. Shoulder asymmetry — absolute difference so either shoulder can be higher
         sh_dev = abs(curr["sh_tilt"] - self.baseline["sh_tilt"])
         if sh_dev > SHOULDER_TILT_THRESHOLD:
             sev = min((sh_dev - SHOULDER_TILT_THRESHOLD) / SHOULDER_TILT_THRESHOLD + 0.5, 1.0)
             alerts.append({"type": "shoulder_tilt", "msg": ALERT_LABELS["shoulder_tilt"], "severity": round(sev, 2)})
             score -= int(_DEDUCTIONS["shoulder_tilt"] * sev)
 
-        # 3. Head tilt — only when both ears were clearly visible in this frame
+        # 3. Head tilt — skipped when ears aren't clearly visible (hair/angle noise)
         tilt_dev = abs(curr["ear_tilt"] - self.baseline["ear_tilt"])
         if curr["ears_visible"] and tilt_dev > EAR_TILT_THRESHOLD_DEG:
             sev = min((tilt_dev - EAR_TILT_THRESHOLD_DEG) / EAR_TILT_THRESHOLD_DEG + 0.5, 1.0)
             alerts.append({"type": "head_tilt", "msg": ALERT_LABELS["head_tilt"], "severity": round(sev, 2)})
             score -= int(_DEDUCTIONS["head_tilt"] * sev)
 
-        # 4. Forward lean — shoulder width increases as person leans toward camera
+        # 4. Forward lean — shoulders appear wider when user moves closer to the camera
         lean_dev = curr["sh_width"] - self.baseline["sh_width"]
         if lean_dev > FORWARD_LEAN_THRESHOLD:
             sev = min((lean_dev - FORWARD_LEAN_THRESHOLD) / FORWARD_LEAN_THRESHOLD + 0.5, 1.0)
@@ -139,8 +154,8 @@ class PostureAnalyzer:
 
     def _features(self, lm):
         """
-        Extract 5 normalised posture features from a landmark list.
-        Returns None if key landmarks have low visibility.
+        Extract six posture features from a MediaPipe landmark list.
+        Returns None if shoulder landmarks have low visibility (person out of frame).
         """
         l_sh = lm[_LEFT_SHOULDER]
         r_sh = lm[_RIGHT_SHOULDER]
@@ -156,27 +171,27 @@ class PostureAnalyzer:
         sh_mid_y = (l_sh.y + r_sh.y) / 2
         sh_width = abs(l_sh.x - r_sh.x)
         if sh_width < 0.01:
-            sh_width = 0.01
+            sh_width = 0.01   # guard against near-zero when user is side-on
 
-        # Only compute ear tilt when both ears are clearly visible.
-        # Hair, low light, or side-on angles push visibility below 0.5
-        # and cause noisy/false head-tilt readings.
+        # Ear tilt is only meaningful when both ears are clearly visible.
+        # Hair and lateral head rotation push the visibility score below 0.5,
+        # causing the landmark coordinates to drift — giving false head-tilt readings.
         ears_visible = l_ear.visibility >= 0.5 and r_ear.visibility >= 0.5
         ear_tilt = float(
             np.degrees(np.arctan2(r_ear.y - l_ear.y, r_ear.x - l_ear.x))
         ) if ears_visible else 0.0
 
         return {
-            # Positive = nose is below shoulder midpoint (bad); normally negative
+            # positive = nose below shoulder midpoint (head dropping forward)
             "head_y":       (nose.y - sh_mid_y) / sh_width,
-            # Signed tilt: left_sh.y - right_sh.y, normalised
+            # non-zero = one shoulder higher than the other
             "sh_tilt":      (l_sh.y - r_sh.y) / sh_width,
-            # Ear line angle in degrees relative to horizontal (0 when ears not visible)
+            # angle of the ear-to-ear line in degrees; 0 = level
             "ear_tilt":     ear_tilt,
-            # Flag so the analyzer can skip the check when ears weren't detected
+            # float so it can be averaged across calibration frames
             "ears_visible": float(ears_visible),
-            # Shoulder width in normalised image coordinates (larger = closer to camera)
+            # increases when user leans toward camera
             "sh_width":     sh_width,
-            # Horizontal head centering (not alerted on, but stored for future use)
+            # lateral head offset; stored for future use, not alerted on yet
             "head_x":       (nose.x - sh_mid_x) / sh_width,
         }
