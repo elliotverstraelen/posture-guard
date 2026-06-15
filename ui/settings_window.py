@@ -52,11 +52,9 @@ class _SettingsCtrl(NSObject):
         ])
 
     def testNotification_(self, sender):
-        subprocess.Popen([
-            "osascript", "-e",
-            'display notification "If you can see this, notifications are working." '
-            'with title "PostureGuard — Test" sound name "default"',
-        ])
+        import rumps
+        rumps.notification("PostureGuard", "Test",
+                           "If you can see this, notifications are working.")
 
     def cameraChanged_(self, sender):
         idx = sender.indexOfSelectedItem()
