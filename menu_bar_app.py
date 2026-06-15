@@ -20,6 +20,7 @@ import rumps
 
 from ai.coach import get_coaching_tip
 from core.alert_manager import AlertManager
+from notifications import send_notification as _notify
 from core.pose_detector import PoseDetector
 from core.posture_analyzer import PostureAnalyzer
 import core.snapshot_store as snapshots
@@ -172,14 +173,9 @@ class PostureGuard(rumps.App):
             self._calibrated  = False
         self.title = "📐"
         self._rebuild_menu()
-        rumps.notification(
-            title="PostureGuard — Calibrating",
-            subtitle="",
-            message=(
-                "Sit in your normal working position and hold still.\n"
-                "Look at the screen you actually work on — not the camera."
-            ),
-        )
+        _notify("PostureGuard — Calibrating",
+                "Sit in your normal working position and hold still. "
+                "Look at the screen you actually work on — not the camera.")
 
     def _do_pause_toggle(self, _=None):
         with self._lock:
@@ -254,11 +250,8 @@ class PostureGuard(rumps.App):
 
         def on_complete(labeled_count):
             if labeled_count:
-                rumps.notification(
-                    title="Calibration Studio",
-                    subtitle="",
-                    message=f"Labeled {labeled_count} pose(s). Use '🔬 Improve model' when you have 10+.",
-                )
+                _notify("Calibration Studio",
+                        f"Labeled {labeled_count} pose(s). Use '🔬 Improve model' when you have 10+.")
 
         LabelWindow.open(unlabeled[-10:], on_complete=on_complete)
 
@@ -447,8 +440,8 @@ class PostureGuard(rumps.App):
 
         caps = self._open_cameras()
         if not caps:
-            rumps.notification("PostureGuard", "Camera Error",
-                               "Cannot open camera. Grant access and restart.")
+            _notify("PostureGuard — Camera Error",
+                    "Cannot open camera. Grant access in Settings and restart.")
             return
 
         while True:
@@ -546,11 +539,8 @@ class PostureGuard(rumps.App):
             with self._lock:
                 self._calibrating = False
                 self._calibrated  = True
-            rumps.notification(
-                title="PostureGuard",
-                subtitle="Calibration complete ✓",
-                message="Baseline saved. I'll alert you when you slouch.",
-            )
+            _notify("PostureGuard — Calibration complete ✓",
+                    "Baseline saved. I'll alert you when you slouch.")
             return 0
         return cal_count
 
@@ -570,17 +560,10 @@ class PostureGuard(rumps.App):
             with self._lock:
                 self._last_tip     = tip
                 self._alert_count += 1
-            rumps.notification(
-                title="PostureGuard 🧍",
-                subtitle="Posture check",
-                message=tip,
-            )
+            _notify("PostureGuard — Posture check", tip)
         elif result.restored:
-            rumps.notification(
-                title="PostureGuard 🧍",
-                subtitle="Posture restored ✓",
-                message="Good job — back on track! 💪",
-            )
+            _notify("PostureGuard — Posture restored ✓",
+                    "Good job — back on track! 💪")
 
         # Phone posture detection
         if self._settings.phone_detection_enabled:
@@ -605,14 +588,9 @@ class PostureGuard(rumps.App):
             elapsed_min = (time.time() - self._phone_bow_since) / 60
             if elapsed_min >= self._settings.phone_alert_minutes and not self._phone_alerted:
                 self._phone_alerted = True
-                rumps.notification(
-                    title="PostureGuard 📱",
-                    subtitle="Phone check",
-                    message=(
+                _notify("PostureGuard — Phone check",
                         f"You've been looking down for {int(elapsed_min)} min. "
-                        "Put the phone down and sit up! 🙏"
-                    ),
-                )
+                        "Put the phone down and sit up! 🙏")
         else:
             self._phone_bow_since = None
             self._phone_alerted   = False

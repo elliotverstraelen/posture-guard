@@ -51,6 +51,13 @@ class _SettingsCtrl(NSObject):
             "x-apple.systempreferences:com.apple.preference.notifications",
         ])
 
+    def testNotification_(self, sender):
+        subprocess.Popen([
+            "osascript", "-e",
+            'display notification "If you can see this, notifications are working." '
+            'with title "PostureGuard — Test" sound name "default"',
+        ])
+
     def cameraChanged_(self, sender):
         idx = sender.indexOfSelectedItem()
         if 0 <= idx < len(self._cameras):
@@ -198,6 +205,13 @@ def _build(ctrl, settings, cameras) -> NSWindow:
     notif_btn.setTarget_(ctrl)
     notif_btn.setAction_("openNotificationPermissions:")
     cv.addSubview_(notif_btn)
+
+    test_btn = _btn(cv, "Test", _PAD + 208, y - 24, 52, 22)
+    test_btn.setBezelStyle_(2)
+    test_btn.setFont_(NSFont.systemFontOfSize_(11))
+    test_btn.setTarget_(ctrl)
+    test_btn.setAction_("testNotification:")
+    cv.addSubview_(test_btn)
     y -= 34
 
     cb_phone = _checkbox(cv, "Phone detection  —  alert when looking down too long",
